@@ -1,6 +1,6 @@
 # Running one model across an MI50 (gfx906) **and** a modern RDNA4 card (gfx1200) — combined VRAM, one runtime
 
-**TL;DR:** AMD dropped `gfx906` (MI50 / MI60 / Radeon VII) from ROCm after 6.3, and ollama dropped it after 0.12.3. Existing community fixes get a *lone* MI50 running again — but they hard-code `gfx906` only and force `HSA_OVERRIDE_GFX_VERSION=9.0.6`, which **excludes any modern card in the same box**. This repo generalizes that to **multi-arch**: build one ollama runtime that speaks `gfx906` *and* `gfx1200` at once, so an MI50 (16 GB HBM2) and an RX 9060 XT (16 GB GDDR6) act as **~32 GB of combined VRAM** and split a single 32B model across both.
+**TL;DR:** AMD dropped `gfx906` (MI50 / MI60 / Radeon VII) from ROCm after 6.3, and ollama dropped it after 0.12.3. Existing community fixes get a *lone* MI50 running again — but they hard-code `gfx906` only and force `HSA_OVERRIDE_GFX_VERSION=9.0.6`, which **excludes any modern card in the same box**. This repo generalizes that to **multi-arch**: build one ollama runtime that speaks `gfx906` *and* `gfx1200` at once, so an MI50 (16 GB HBM2) and an RX 9060 XT (16 GB GDDR6) act as **~32 GB of combined VRAM** and split a single 32B model across both — **verified at 16.6 tok/s, 100% on GPU** (see [Benchmark](#benchmark)).
 
 Built on the shoulders of [xxDoman](https://github.com/xxDoman) (ROCm-7.1-runtime + ROCm-6.3-Tensile approach) and [MTLoser / Dawson Reed](https://github.com/MTLoser/ollama-mi50-rocm71-build) (the `v0.18.2` source build + SOLVE_TRI patch). The change here is small and additive — see [The multi-arch diff](#the-multi-arch-diff). `build_dual_arch.sh` runs the whole thing.
 
@@ -42,7 +42,7 @@ Starting from MTLoser's `build-ollama.sh` and runtime `Dockerfile`, the edits th
 +    OLLAMA_SCHED_SPREAD=1
 ```
 
-The **SOLVE_TRI patch stays** (it forces that one op to CPU fallback for *all* archs — harmless, rarely hit at inference):
+The **SOLVE_TRI patch stays** (it forces that one op to CPU fallback for *all* archs — harmless, rarely hit at inference; at 8K ctx generation is 100% GPU):
 ```bash
 sed -i '/case GGML_OP_SOLVE_TRI:/s/$/\n            return false; \/\/ fall back to CPU/' \
     ml/backend/ggml/ggml/src/ggml-cuda/ggml-cuda.cu
@@ -70,6 +70,22 @@ docker run -d --name ollama-dual \
 
 ---
 
+## Benchmark
+
+Real numbers from ollama's own eval counters (not synthetic). **qwen2.5:32B Q4_K_M (~20 GB)**, split across MI50 (gfx906) + RX 9060 XT (gfx1200), 8K context, **100% on GPU**:
+
+| Metric | Result |
+|---|---|
+| **Generation** | **16.6 tok/s** (128 tok / 7.69 s) |
+| **Prompt eval** | **174.5 tok/s** (48 tok / 0.28 s) |
+| On GPU | **100%** — all 65 layers, no CPU spill |
+| VRAM per card | 11.7 GB (9060) + 11.7 GB (MI50) — balanced to the byte |
+| Model load | 17.6 s (one-time) |
+
+Context for the number: a single 24 GB card runs 32B Q4 at ~30–40 t/s; a V100-32 ~20–25. Two 16 GB budget/salvage cards splitting a model over PCIe and landing at **~17 t/s** is respectable — and it runs a model that fits on **neither** card alone. The heterogeneous PCIe-boundary handoff is the real cost (as expected); the `SOLVE_TRI→CPU` patch is **not** in the inference path, so it costs nothing at generation time (verified: 100% GPU at 8K ctx).
+
+---
+
 ## Hardware this was done on
 
 | Card | Arch | VRAM | Role in split |
@@ -88,14 +104,8 @@ Host: Ryzen 9 7900X, Ubuntu 24.04.4, kernel 6.8, `amdgpu-dkms 6.12.12`.
 - ✅ Both cards kernel-bound after `amdgpu-dkms 6.4.2` + reboot (9060 went from "no driver" to enumerated).
 - ✅ Each card computes on its *own* stock ollama (MI50 on 0.12.3, 9060 on 0.32.5).
 - ✅ Reproduced the graft segfault on gfx906 under ROCm 7.2 (confirms the SOLVE_TRI source patch is required, not just Tensile files).
-- ✅ **Dual-arch build runs, both cards in one runtime, model splits across them — no segfault.** One ollama process enumerates `compute=gfx906 (MI50, 16 GiB)` **and** `compute=gfx1200 (RX 9060 XT, 15.9 GiB)` under ROCm 7.1 (driver 70125). A 14b model with `OLLAMA_SCHED_SPREAD=1` reports:
-
-```
-load_tensors: offloaded 49/49 layers to GPU
-ROCm0 model buffer size = 4083 MiB   # RX 9060 XT (gfx1200)
-ROCm1 model buffer size = 4065 MiB   # MI50       (gfx906)
-```
-  …and generates clean output (no crash). Split across the pair = **~32 GB combined VRAM**, enough for a 32B model. Runs inside a Docker container (`--device=/dev/kfd`), so the host stays on its own ROCm — which doubles as the "keep the two ROCm worlds isolated" answer.
+- ✅ **Dual-arch build runs, both cards in one runtime, model splits across them — no segfault.** One ollama process enumerates `compute=gfx906 (MI50, 16 GiB)` **and** `compute=gfx1200 (RX 9060 XT, 15.9 GiB)` under ROCm 7.1 (driver 70125).
+- ✅ **32B Q4_K_M runs split across the pair at 16.6 tok/s, 100% GPU** (see [Benchmark](#benchmark)). A 14b split reports `offloaded 49/49 layers` across `ROCm0` + `ROCm1`.
 
 ## Credits
 - [xxDoman/ollama_mi50](https://github.com/xxDoman/ollama_mi50) — ROCm 7.1 runtime + ROCm 6.3 Tensile method.
