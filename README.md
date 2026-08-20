@@ -84,11 +84,13 @@ Real numbers from ollama's own eval counters (not synthetic). **qwen2.5:32B Q4_K
 | On GPU | **100%** — all 65 layers, no CPU spill |
 | VRAM per card | 11.7 GB (9060) + 11.7 GB (MI50) — balanced to the byte |
 | Model load | 17.6 s (one-time) |
-| **2 concurrent requests** | **33.2 tok/s aggregate** (16.6 + 16.6; wall 14.8 s vs 23.6 s serial) |
+| **2 concurrent requests** | **23.7 tok/s aggregate** (1.5x; measured 2026-08-20 at 2K ctx, see below). An earlier "33.2 / 2.0x" figure summed per-request rates and was wrong. |
 
 Context for the number: a single 24 GB card runs 32B Q4 at ~30–40 t/s; a V100-32 ~20–25. Two 16 GB budget/salvage cards splitting a model over PCIe and landing at **~17 t/s** is respectable — and it runs a model that fits on **neither** card alone. The heterogeneous PCIe-boundary handoff is the real cost (as expected); the `SOLVE_TRI→CPU` patch is **not** in the inference path, so it costs nothing at generation time (verified: 100% GPU at 8K ctx).
 
-**Concurrency is where the second card earns its keep.** A layer split is serial for a *single* request — while card 0 runs the early layers, card 1 is idle (it's acting as a RAM coffer, not a co-processor). With **two requests in flight**, the pipeline overlaps: card 0 works request A's early layers while card 1 works request B's late layers. Measured: 2× throughput, near-perfectly. If your workload is batchable (corpus processing, multi-user), set `OLLAMA_NUM_PARALLEL=2` and you get both cards actually crunching.
+> **Update 2026-08-20: that 16.6 tok/s was measured with the MI50 on a PCIe Gen1 x4 link (0.8 GB/s).** We did not know that when we published. See [The P2P reality check](#the-p2p-reality-check-measured). The number is real; the ceiling it hit was a slot, not the architecture mix.
+
+**Concurrency is where the second card earns some of its keep.** A layer split is serial for a *single* request — while card 0 runs the early layers, card 1 is idle (it's acting as a RAM coffer, not a co-processor). With **two requests in flight**, the pipeline overlaps: card 0 works request A's early layers while card 1 works request B's late layers. Measured cleanly (total tokens / wall-clock, idle GPUs, 2K ctx): **1.5x at N=2, 1.73x at N=4**, with the knee at N=2. We first published "2x" from summing per-request rates; that was the wrong arithmetic and is retracted. Note the inter-card hop on this box was PCIe Gen1 x4 (see [P2P](#the-p2p-reality-check-measured)), which also taxes the pipelined case; expect the curve to improve on a sane slot.
 
 ---
 
@@ -99,7 +101,7 @@ Context for the number: a single 24 GB card runs 32B Q4 at ~30–40 t/s; a V100-
 | Radeon Instinct **MI50** / Pro VII | gfx906 (Vega 20) | 16 GB **HBM2** (~1 TB/s) | the fast-memory half |
 | Radeon **RX 9060 XT** (Gigabyte Gaming OC) | gfx1200 (Navi 44, RDNA4) | 16 GB GDDR6 | the modern half |
 
-Host: Ryzen 9 7900X, Ubuntu 24.04.4, kernel 6.8, `amdgpu-dkms 6.12.12`.
+Host: Ryzen 9 7900X, Ubuntu 24.04.4, kernel 6.8, `amdgpu-dkms 6.12.12`. Slots: 9060 XT on CPU lanes (`00:01.1`, x16 Gen5), MI50 on **chipset lanes** (`00:02.1` → 600-series → `05:00.0`, x4 physical, negotiated **Gen1**). The Raphael iGPU (gfx1036) is also visible to ROCm; ollama ignores it for the split.
 
 > Note on the MI50 "32 GB" myth: a board reporting subsystem `1002:081e` can be a 32 GB-class PCB, but the VBIOS string is authoritative — ours reads `60CU/16GB 4HI` (4-high HBM stacks = 16 GB). 8-Hi = 32 GB. Don't assume 32 GB from the subsystem ID alone.
 
@@ -123,17 +125,28 @@ So for a given card to join the pool it needs exactly three things:
 | **rocBLAS/Tensile libs exist for its arch in the runtime** | `ls /opt/rocm/lib/rocblas/library/ \| grep gfxNNNN` inside the image | arch still supported → ROCm 7.1 already ships it; arch dropped → overlay the Tensile files from the **last ROCm that shipped it** (what we did for `gfx906` from 6.3) |
 | **HIP compiler emits working code for it** | the model runs without segfault on that card | a compiler regression like `SOLVE_TRI` on gfx906 → find the op, force it to CPU fallback (same one-line `sed` pattern) |
 
+For reference, the rocBLAS/Tensile tree inside our `ollama-dual` image (ROCm 7.1 runtime + the 906 overlay) contains exactly these archs:
+
+```
+gfx906 (overlaid)  gfx908  gfx90a  gfx942  gfx950
+gfx1030  gfx1100  gfx1101  gfx1102  gfx1150  gfx1151  gfx1200  gfx1201
+```
+
+Anything on that list needs only an `AMDGPU_TARGETS` entry. Anything not on it (gfx900 Vega 10, gfx803 Polaris, gfx1010/1012 Navi 10) needs the overlay trick from whatever ROCm last shipped it.
+
 Candidate pairings that *should* work by this logic (ordered by how confident we are — **none tested**):
 
 | Pair | Combined VRAM | Why it should work | Watch out for |
 |---|---|---|---|
 | MI50 `gfx906` + RX 7900 XTX `gfx1100` | 16 + 24 = 40 GB | gfx1100 is a current RDNA3 target; same 906 overlay as here | nothing new — closest to the tested case |
-| MI50 `gfx906` + RX 6800/6900 `gfx1030` | 16 + 16 = 32 GB | gfx1030 is RDNA2; check it's in 7.1's rocBLAS tree (`ls` above) — if not, overlay from the last ROCm that shipped it | same overlay pattern as 906 |
+| MI50 `gfx906` + RX 6800/6900 `gfx1030` | 16 + 16 = 32 GB | gfx1030 **is in the ROCm 7.1 rocBLAS tree** (verified in our image) | nothing new |
 | 2× MI50 `gfx906` + RX 9060 XT `gfx1200` | 48 GB | same build, three devices, `SCHED_SPREAD` handles N | PCIe lanes / power; per-request speed bounded by the slowest hop |
-| MI100 `gfx908` + anything modern | 32 + N GB | CDNA1; if 7.1's rocBLAS still ships gfx908 (`ls` above), **no overlay needed** — just add it to `AMDGPU_TARGETS` | we haven't checked 7.1's tree for gfx908 |
-| MI210 `gfx90a` + RX 9070 `gfx1201` | 64 + 16 GB | CDNA2 is a current ROCm target; this is the "datacenter pull + gaming card" case | gfx1201 needs the newer `amdgpu-dkms` |
+| MI100 `gfx908` + anything modern | 32 + N GB | gfx908 **is in the ROCm 7.1 rocBLAS tree** (verified in our image), so **no overlay needed**: just add it to `AMDGPU_TARGETS` | — |
+| MI210 `gfx90a` + RX 9070 `gfx1201` | 64 + 16 GB | gfx90a and gfx1201 are **both in the 7.1 rocBLAS tree**; this is the "datacenter pull + gaming card" case | gfx1201 needs the newer `amdgpu-dkms` |
 | Radeon VII `gfx906` + RX 9060 XT `gfx1200` | 16 + 16 GB | Radeon VII **is** gfx906 — this is the consumer version of the tested pair | should be identical |
 | Vega 64 `gfx900` + modern | 8 + N GB | gfx900 was dropped **before** gfx906; Tensile overlay would come from ROCm ≤ 5.7 | older overlay on a 7.1 runtime = more ABI risk; the most speculative row |
+
+**Which slot matters more than which card.** On a consumer board the second x16-physical slot is usually x4 on chipset lanes, and (as we found the hard way) it can negotiate down to Gen1. Run `scripts/p2p_check.sh` before you benchmark anything; it prints the upstream port's real link speed. Put the card that holds the most layers on CPU lanes.
 
 Two honest limits that *don't* go away:
 
@@ -142,22 +155,70 @@ Two honest limits that *don't* go away:
 
 The point of the method isn't a specific pair. It's that **AMD dropping an arch from ROCm no longer strands that card** — the Tensile overlay + multi-arch target keeps it computing next to whatever you buy next.
 
-## Measurements still owed
+## The P2P reality check (measured)
 
-Suggested by the ROCm AI Assistant on the AMD Discord (2026-08-20), and fair. Scripts are in `scripts/`; results go here as they land.
+The ROCm AI Assistant on the AMD Discord asked for three things (2026-08-20): measure peer-to-peer between the archs, find the concurrency knee, and call out `iommu=pt`. Fair asks. Scripts are in `scripts/`, and here is what they found on the box above.
 
-| Measurement | Why it matters | How | Result |
-|---|---|---|---|
-| **Peer-to-peer between the two archs** | If `hipDeviceCanAccessPeer` says no (common across GPU generations), every inter-card tensor copy stages through system RAM. That is the single-request speed ceiling, and a number beats a guess. | `scripts/p2p_check.sh` (builds `p2p_check.cpp` in the container; falls back to `rocm-bandwidth-test`) | *pending* |
-| **Concurrency knee** | 2 in flight = 2.0x. Where does it stop? That N is the one to deploy at. | `scripts/concurrency_sweep.sh qwen2.5:32b 4` with `OLLAMA_NUM_PARALLEL=4` | *pending* (N=1: 16.6, N=2: 33.2 aggregate) |
-| **`iommu=pt` on the test box** | Was it set, or did we get lucky? | `grep -o 'iommu=[a-z]*' /proc/cmdline` | *pending* |
-| **Other card pairs** | Turns one proof of concept into a reference matrix. | Build with your archs in `AMDGPU_TARGETS`, run the model, report | see table below |
+### Peer-to-peer: `scripts/p2p_check.sh`
+
+`hipDeviceCanAccessPeer` says **yes** for every pair. Bandwidth says something else (256 MiB x 10, `hipMemcpyPeer` vs explicit device→pinned-host→device):
+
+| src → dst | peer GB/s | via-host GB/s |
+|---|---|---|
+| RX 9060 XT (gfx1200) → MI50 (gfx906) | **0.79** | 0.81 |
+| MI50 (gfx906) → RX 9060 XT (gfx1200) | **0.82** | 0.81 |
+| RX 9060 XT → Raphael iGPU (gfx1036) | 27.01 | 11.32 |
+| Raphael iGPU → RX 9060 XT | 14.59 | 11.62 |
+| MI50 → iGPU / iGPU → MI50 | 0.82 / 0.83 | 0.80 / 0.81 |
+
+Peer ≈ via-host on the 906↔1200 pair, so the peer path buys nothing there. But the real finding is the absolute number: **everything that touches the MI50 caps at 0.8 GB/s**, while the 9060 moves 27 GB/s to the iGPU under the same load. We chased it:
+
+- Not the BAR: both cards have a 16 GB large BAR (`lspci -vv` Region 0).
+- Not SDMA: `HSA_ENABLE_SDMA=0` gives the same 0.8 GB/s.
+- Not the IOMMU: `iommu=pt` was **not** set on this box, and all three GPUs were already in `identity` IOMMU groups. Setting it would not have changed anything here.
+- Not the card's link: `lspci -vv -s 08:00.0` and sysfs both say **x16 @ 16 GT/s**. That is the Vega 20 board's *internal* bridge→GPU link.
+- **It is the slot.** `lspci -tv` puts the MI50 behind the 600-series chipset, and the chipset downstream port feeding it (`05:00.0`) is linked at **x4 @ 2.5 GT/s = PCIe Gen1 x4 ≈ 1 GB/s raw**. The kernel said so at boot and nobody read it:
+
+```
+pci 0000:08:00.0: 8.000 Gb/s available PCIe bandwidth, limited by 2.5 GT/s PCIe x4 link
+    at 0000:05:00.0 (capable of 252.048 Gb/s with 16.0 GT/s PCIe x16 link)
+```
+
+The port is *capable* of x4 @ 16 GT/s (~7.9 GB/s) and never ramps: not under sustained copy load, not with `rocm-smi --setperflevel high`. So it is a BIOS/negotiation/seating problem on the chipset slot, not power management. Fix candidates, in order: set the chipset PCIe slot speed explicitly to Gen4 in BIOS instead of Auto; reseat the card; or, properly, put the dropped card on **CPU lanes** (swap slots, or bifurcate the CPU x16 to x8/x8 so both cards get direct lanes).
+
+**The lesson, generalized:** `p2p_check.sh` now prints the link state of each GPU's **upstream port** and greps the kernel log for `limited by`. Check the slot, not the card. A salvage datacenter card in a consumer board's second x16-physical slot is very likely on chipset lanes, and that slot can negotiate down silently.
+
+**What this means for the numbers:** the 16.6 tok/s single-request figure and the 0.8 GB/s handoff were measured on the same Gen1 x4 link. Every inter-card activation transfer paid ~10x more than it should have. We will re-measure after the slot is fixed; the expectation is a real single-request gain, since the layer-boundary handoff is the serial cost in a split.
+
+### Concurrency knee: `scripts/concurrency_sweep.sh`
+
+Under `OLLAMA_NUM_PARALLEL=2` at 8K context, qwen2.5:32b Q4_K_M occupies **31.1 GB of the 32 GB**. `OLLAMA_NUM_PARALLEL=4` at the default context does not load at all (KV cache for 4 slots does not fit). Results:
+
+Measured 2026-08-20 with the corpus worker paused and the container freshly restarted (idle GPUs), `num_predict=128`, aggregate = total generated tokens / batch wall-clock:
+
+| NUM_PARALLEL / ctx | N in flight | wall s | per-request tok/s | aggregate tok/s | speedup |
+|---|---|---|---|---|---|
+| 4 / 2048 | 1 | 8.2 | 16.5 | 15.7 | 1.00x |
+| 4 / 2048 | 2 | 10.8 | 12.4 | 23.7 | **1.51x** |
+| 4 / 2048 | 3 | 15.7 | 8.6 | 24.5 | 1.56x |
+| 4 / 2048 | 4 | 18.9 | 7.1 | 27.1 | 1.73x |
+| 2 / 32768 (model default) | 1 | 35.9 | **3.7** | 3.6 | — |
+| 2 / 32768 (model default) | 2 | 49.9 | 3.1 | 5.1 | — |
+
+Two lessons in that table:
+
+- **The knee is N=2.** Going 2 → 4 buys another ~15% aggregate while per-request speed halves. For a batch workload run `OLLAMA_NUM_PARALLEL=2`; for interactive use run 1.
+- **Set the context length explicitly.** Without `OLLAMA_CONTEXT_LENGTH` (or `num_ctx` on every request), ollama loads qwen2.5 at its **32K default**, multiplied by `NUM_PARALLEL`. At 2 slots that put 31.1 GB in VRAM (`size` > `size_vram`, i.e. partial offload) and single-request generation fell to **3.7 tok/s** with no warning. At 4 slots it refuses to load: `model requires more system memory (47.7 GiB) than is available`. The 16.6 tok/s headline number is at 8K; at 2K the same model takes 23 GB.
+
+### `iommu=pt`
+
+Documented in the setup section above. On this box it was **not set** and was **not the cause** of the slow link (IOMMU groups were already `identity`). We still recommend it for multi-GPU per AMD's docs; just do not expect it to fix a link-speed problem.
 
 ### Tested-pairs matrix
 
 | Pair | Archs | Combined VRAM | 32B Q4 gen tok/s | Who | Notes |
 |---|---|---|---|---|---|
-| MI50 + RX 9060 XT | gfx906 + gfx1200 | 32 GB | 16.6 (33.2 @ 2 concurrent) | Elyan Labs | the original |
+| MI50 + RX 9060 XT | gfx906 + gfx1200 | 32 GB | 16.6 (23.7 aggregate @ 2 concurrent) | Elyan Labs | the original; MI50 was on a **Gen1 x4 chipset slot** at the time (see P2P section), re-measure pending |
 | *your pair here* | | | | | **open an issue** with `rocm-smi` output, the `AMDGPU_TARGETS` you built with, and `ollama ps` showing the split |
 
 We do not own a gfx908 / gfx90a card, so the CDNA rows in the candidate table above stay theory until someone with an MI100 or MI210 runs it. If that is you, the whole build is `./build_dual_arch.sh` with your archs edited in.

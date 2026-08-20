@@ -8,6 +8,16 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 
 echo "== host: iommu / kernel cmdline"
 grep -oE 'iommu=[a-z]+|amd_iommu=[a-z]+' /proc/cmdline || echo "(no iommu= on cmdline)"
+echo "== PCIe link of each GPU's UPSTREAM port (the slot), not the card's own link"
+# A card can report x16 @ 16 GT/s on its internal bridge while the slot feeding it
+# sits at x4 @ 2.5 GT/s. The kernel logs exactly this at boot; surface it.
+for dev in $(lspci -Dn | awk '$2=="0300:"||$2=="0302:"||$2=="0380:"{print $1}'); do
+  up="$(basename "$(dirname "$(readlink -f /sys/bus/pci/devices/$dev)")")"
+  printf "  %s %-40s slot-port %s: %sx @ %s (max %sx @ %s)\n" "$dev" "$(lspci -s "$dev" | sed 's/.*: //' | cut -c1-40)" "$up" \
+    "$(cat /sys/bus/pci/devices/$up/current_link_width 2>/dev/null)" "$(cat /sys/bus/pci/devices/$up/current_link_speed 2>/dev/null)" \
+    "$(cat /sys/bus/pci/devices/$up/max_link_width 2>/dev/null)" "$(cat /sys/bus/pci/devices/$up/max_link_speed 2>/dev/null)"
+done
+(journalctl -k -b --no-pager 2>/dev/null || dmesg 2>/dev/null) | grep -E 'available PCIe bandwidth, limited by' | sed 's/^/  kernel: /' | cut -c1-200
 echo "== rocm-smi topology (host)"
 rocm-smi --showtopo 2>/dev/null | grep -vE '^=+$' | sed -n '1,40p' || true
 
