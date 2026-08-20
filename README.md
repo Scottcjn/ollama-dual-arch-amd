@@ -81,8 +81,11 @@ Real numbers from ollama's own eval counters (not synthetic). **qwen2.5:32B Q4_K
 | On GPU | **100%** — all 65 layers, no CPU spill |
 | VRAM per card | 11.7 GB (9060) + 11.7 GB (MI50) — balanced to the byte |
 | Model load | 17.6 s (one-time) |
+| **2 concurrent requests** | **33.2 tok/s aggregate** (16.6 + 16.6; wall 14.8 s vs 23.6 s serial) |
 
 Context for the number: a single 24 GB card runs 32B Q4 at ~30–40 t/s; a V100-32 ~20–25. Two 16 GB budget/salvage cards splitting a model over PCIe and landing at **~17 t/s** is respectable — and it runs a model that fits on **neither** card alone. The heterogeneous PCIe-boundary handoff is the real cost (as expected); the `SOLVE_TRI→CPU` patch is **not** in the inference path, so it costs nothing at generation time (verified: 100% GPU at 8K ctx).
+
+**Concurrency is where the second card earns its keep.** A layer split is serial for a *single* request — while card 0 runs the early layers, card 1 is idle (it's acting as a RAM coffer, not a co-processor). With **two requests in flight**, the pipeline overlaps: card 0 works request A's early layers while card 1 works request B's late layers. Measured: 2× throughput, near-perfectly. If your workload is batchable (corpus processing, multi-user), set `OLLAMA_NUM_PARALLEL=2` and you get both cards actually crunching.
 
 ---
 
@@ -99,6 +102,43 @@ Host: Ryzen 9 7900X, Ubuntu 24.04.4, kernel 6.8, `amdgpu-dkms 6.12.12`.
 
 ---
 
+## Beyond MI50 + 9060 XT: this should work for *any* mix of AMD cards
+
+> **Status: theory, not yet tested.** Only `gfx906 + gfx1200` has been run. Everything in this section follows from how the pieces work, not from a measurement. If you try another pair, open an issue with the result either way.
+
+Nothing in the method is specific to Vega 20 or Navi 44. The two walls were (1) *the kernel didn't bind one card* and (2) *no single runtime carried both archs' kernels*. Both walls are generic, and so is the fix:
+
+- **`-DAMDGPU_TARGETS` is a list.** HIP builds a fat binary with one code object per arch; at runtime each device loads the object matching its own ISA. `"gfx906;gfx1200"` is just the list we needed — `"gfx906;gfx1030;gfx1100;gfx1200"` is the same build with more entries and a bigger binary.
+- **`HSA_OVERRIDE_GFX_VERSION` is process-wide.** That's exactly why the single-card fixes broke mixing: the override lies to *every* device about its ISA. Drop it and each card reports its real arch. (Only ever set it for a *lone* unsupported card.)
+- **`OLLAMA_SCHED_SPREAD=1` doesn't care what the cards are.** It spreads layers across every ROCm device it enumerates, proportional to free VRAM. Three or four cards is the same flag.
+
+So for a given card to join the pool it needs exactly three things:
+
+| Requirement | How you know | If it's missing |
+|---|---|---|
+| **Kernel binds it** | `lspci -k` shows `amdgpu` on the card; it appears in `rocm-smi` | newer card → newer `amdgpu-dkms` (kernel module only, as above); older card → usually already bound |
+| **rocBLAS/Tensile libs exist for its arch in the runtime** | `ls /opt/rocm/lib/rocblas/library/ \| grep gfxNNNN` inside the image | arch still supported → ROCm 7.1 already ships it; arch dropped → overlay the Tensile files from the **last ROCm that shipped it** (what we did for `gfx906` from 6.3) |
+| **HIP compiler emits working code for it** | the model runs without segfault on that card | a compiler regression like `SOLVE_TRI` on gfx906 → find the op, force it to CPU fallback (same one-line `sed` pattern) |
+
+Candidate pairings that *should* work by this logic (ordered by how confident we are — **none tested**):
+
+| Pair | Combined VRAM | Why it should work | Watch out for |
+|---|---|---|---|
+| MI50 `gfx906` + RX 7900 XTX `gfx1100` | 16 + 24 = 40 GB | gfx1100 is a current RDNA3 target; same 906 overlay as here | nothing new — closest to the tested case |
+| MI50 `gfx906` + RX 6800/6900 `gfx1030` | 16 + 16 = 32 GB | gfx1030 is RDNA2; check it's in 7.1's rocBLAS tree (`ls` above) — if not, overlay from the last ROCm that shipped it | same overlay pattern as 906 |
+| 2× MI50 `gfx906` + RX 9060 XT `gfx1200` | 48 GB | same build, three devices, `SCHED_SPREAD` handles N | PCIe lanes / power; per-request speed bounded by the slowest hop |
+| MI100 `gfx908` + anything modern | 32 + N GB | CDNA1; if 7.1's rocBLAS still ships gfx908 (`ls` above), **no overlay needed** — just add it to `AMDGPU_TARGETS` | we haven't checked 7.1's tree for gfx908 |
+| MI210 `gfx90a` + RX 9070 `gfx1201` | 64 + 16 GB | CDNA2 is a current ROCm target; this is the "datacenter pull + gaming card" case | gfx1201 needs the newer `amdgpu-dkms` |
+| Radeon VII `gfx906` + RX 9060 XT `gfx1200` | 16 + 16 GB | Radeon VII **is** gfx906 — this is the consumer version of the tested pair | should be identical |
+| Vega 64 `gfx900` + modern | 8 + N GB | gfx900 was dropped **before** gfx906; Tensile overlay would come from ROCm ≤ 5.7 | older overlay on a 7.1 runtime = more ABI risk; the most speculative row |
+
+Two honest limits that *don't* go away:
+
+- **Per-request speed is gated by the slowest card and the PCIe hop**, not the sum. Mixing an MI50 with a 7900 XTX gets you the XTX's VRAM, not the XTX's speed, on the layers that land on the MI50. Concurrency (above) is how you recover aggregate throughput.
+- **VRAM adds; bandwidth doesn't.** HBM2 + GDDR6 pool fine for *capacity*. Layers on the GDDR card run at GDDR speed.
+
+The point of the method isn't a specific pair. It's that **AMD dropping an arch from ROCm no longer strands that card** — the Tensile overlay + multi-arch target keeps it computing next to whatever you buy next.
+
 ## Status / verified
 
 - ✅ Both cards kernel-bound after `amdgpu-dkms 6.4.2` + reboot (9060 went from "no driver" to enumerated).
@@ -106,6 +146,12 @@ Host: Ryzen 9 7900X, Ubuntu 24.04.4, kernel 6.8, `amdgpu-dkms 6.12.12`.
 - ✅ Reproduced the graft segfault on gfx906 under ROCm 7.2 (confirms the SOLVE_TRI source patch is required, not just Tensile files).
 - ✅ **Dual-arch build runs, both cards in one runtime, model splits across them — no segfault.** One ollama process enumerates `compute=gfx906 (MI50, 16 GiB)` **and** `compute=gfx1200 (RX 9060 XT, 15.9 GiB)` under ROCm 7.1 (driver 70125).
 - ✅ **32B Q4_K_M runs split across the pair at 16.6 tok/s, 100% GPU** (see [Benchmark](#benchmark)). A 14b split reports `offloaded 49/49 layers` across `ROCm0` + `ROCm1`.
+
+## What people are saying
+
+> "This method is truly groundbreaking. It removes the `HSA_OVERRIDE_GFX_VERSION=9.0.6` variable and compiles both architecture kernels (GFX906; GFX1200) together during compilation. Then, it uses `OLLAMA_SCHED_SPREAD=1` to distribute the model layers across both cards, each using its own actual model. With just two lines of modification, a defunct MI50 and a gaming card can achieve 32GB of storage, capable of running 32B (Q4, 65 layers all on GPU, 16.6 tok/s) that a single card can't handle. Impressive, very innovative, and provides a new solution for some users."
+>
+> — Guo Hongwei, AMD Developer Discord `#rocm`, 2026-08-20
 
 ## Credits
 - [xxDoman/ollama_mi50](https://github.com/xxDoman/ollama_mi50) — ROCm 7.1 runtime + ROCm 6.3 Tensile method.
