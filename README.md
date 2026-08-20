@@ -18,6 +18,8 @@ sudo reboot
 # after: both cards show in `rocm-smi`, both bound to amdgpu in `lspci -k`
 ```
 
+> **Multi-GPU boot flag: `iommu=pt`.** AMD's ROCm system-requirements docs say systems with multiple GPUs *may* need `iommu=pt` on the kernel command line to avoid application hangs. A mixed-arch box is at least as exposed as a homogeneous one. If you see hangs once both cards are in play, add `iommu=pt` to `GRUB_CMDLINE_LINUX_DEFAULT` in `/etc/default/grub`, `update-grub`, reboot, and confirm with `grep -o 'iommu=pt' /proc/cmdline`. Our test box ran without it; we have not yet checked whether it was set (see [Measurements still owed](#measurements-still-owed)).
+
 **Wall 2 — stock ollama can't run both archs in one process.**
 - `ollama 0.12.3` bundles a ROCm with native `gfx906` → the MI50 computes clean, but it has **no** `gfx1200`, so the 9060 is invisible.
 - `ollama 0.32.5` bundles ROCm 7.2 with native `gfx1200` → the 9060 works, but `gfx906` was removed. Grafting ROCm-6.3 `gfx906` Tensile files into it fixes *enumeration* but **segfaults on the first gfx906 GEMM** — ROCm 7's HIP compiler generates broken device code for one kernel (`SOLVE_TRI`) on gfx906.
@@ -138,6 +140,26 @@ Two honest limits that *don't* go away:
 - **VRAM adds; bandwidth doesn't.** HBM2 + GDDR6 pool fine for *capacity*. Layers on the GDDR card run at GDDR speed.
 
 The point of the method isn't a specific pair. It's that **AMD dropping an arch from ROCm no longer strands that card** — the Tensile overlay + multi-arch target keeps it computing next to whatever you buy next.
+
+## Measurements still owed
+
+Suggested by the ROCm AI Assistant on the AMD Discord (2026-08-20), and fair. Scripts are in `scripts/`; results go here as they land.
+
+| Measurement | Why it matters | How | Result |
+|---|---|---|---|
+| **Peer-to-peer between the two archs** | If `hipDeviceCanAccessPeer` says no (common across GPU generations), every inter-card tensor copy stages through system RAM. That is the single-request speed ceiling, and a number beats a guess. | `scripts/p2p_check.sh` (builds `p2p_check.cpp` in the container; falls back to `rocm-bandwidth-test`) | *pending* |
+| **Concurrency knee** | 2 in flight = 2.0x. Where does it stop? That N is the one to deploy at. | `scripts/concurrency_sweep.sh qwen2.5:32b 4` with `OLLAMA_NUM_PARALLEL=4` | *pending* (N=1: 16.6, N=2: 33.2 aggregate) |
+| **`iommu=pt` on the test box** | Was it set, or did we get lucky? | `grep -o 'iommu=[a-z]*' /proc/cmdline` | *pending* |
+| **Other card pairs** | Turns one proof of concept into a reference matrix. | Build with your archs in `AMDGPU_TARGETS`, run the model, report | see table below |
+
+### Tested-pairs matrix
+
+| Pair | Archs | Combined VRAM | 32B Q4 gen tok/s | Who | Notes |
+|---|---|---|---|---|---|
+| MI50 + RX 9060 XT | gfx906 + gfx1200 | 32 GB | 16.6 (33.2 @ 2 concurrent) | Elyan Labs | the original |
+| *your pair here* | | | | | **open an issue** with `rocm-smi` output, the `AMDGPU_TARGETS` you built with, and `ollama ps` showing the split |
+
+We do not own a gfx908 / gfx90a card, so the CDNA rows in the candidate table above stay theory until someone with an MI100 or MI210 runs it. If that is you, the whole build is `./build_dual_arch.sh` with your archs edited in.
 
 ## Status / verified
 
