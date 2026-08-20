@@ -24,6 +24,9 @@ for N in $(seq 1 "$MAXN"); do
   t0=$(date +%s.%N)
   for i in $(seq 1 "$N"); do one "$i" & done; wait
   wall=$(echo "$(date +%s.%N) - $t0" | bc)
+  if jq -e 'select(.error != null or .eval_count == null)' "$T"/r*.json >/dev/null 2>&1; then
+    echo "N=$N: a request failed:"; jq -c '{error, done_reason}' "$T"/r*.json; echo "(is OLLAMA_NUM_PARALLEL >= $N, and does N x num_ctx of KV cache fit in VRAM?)"; break
+  fi
   # per-request rate = eval_count / eval_duration(ns); aggregate = total tokens / wall
   per=$(jq -s '[.[] | (.eval_count / (.eval_duration/1e9))] | add/length' "$T"/r*.json)
   tot=$(jq -s '[.[] | .eval_count] | add' "$T"/r*.json)
