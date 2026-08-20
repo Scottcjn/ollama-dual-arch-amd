@@ -1,11 +1,18 @@
 #!/bin/bash
-# Build a dual-arch (gfx906 + gfx1200) ollama from MTLoser's gfx906 base.
+# Build a multi-arch (default gfx906 + gfx1200) ollama from MTLoser's gfx906 base.
 # Produces a docker image `ollama-dual` that runs an MI50 (Vega20) and a modern
 # RDNA4 card (e.g. RX 9060 XT) in ONE runtime and splits a model across both.
 # See README.md. Requires: docker, ~40GB disk, a decent internet link (ROCm 7.1
 # is pulled twice). Prereq: both cards must already be kernel-bound -- see
 # README "Wall 1" (amdgpu-dkms 6.4.2 for Navi 44).
 set -euxo pipefail
+
+# Which archs to compile for. Default is the tested pair. For another mix,
+# e.g. MI50 + 7900 XTX:  ARCHS="gfx906;gfx1100" ./build_dual_arch.sh
+# Any arch you add must have rocBLAS/Tensile libs in the runtime image
+# (ROCm 7.1 ships current archs; dropped ones need an overlay like the 906 one
+# MTLoser's base already carries). See README "Beyond MI50 + 9060 XT".
+ARCHS="${ARCHS:-gfx906;gfx1200}"
 
 # 1. base repo (MTLoser) -- the 906 Tensile libs, Dockerfiles, and SOLVE_TRI patch script
 if [ ! -d ollama-mi50-rocm71-build ]; then
@@ -21,7 +28,8 @@ fi
 cp -f amdgpu-install_7.1.70100-1_all.deb amdgpu-install_6.3.70100-1_all.deb
 
 # 3. THE multi-arch change: compile for BOTH archs (base is gfx906 only).
-sed -i 's/-DAMDGPU_TARGETS="gfx906"/-DAMDGPU_TARGETS="gfx906;gfx1200"/' build-ollama.sh
+sed -i "s/-DAMDGPU_TARGETS=\"gfx906\"/-DAMDGPU_TARGETS=\"${ARCHS}\"/" build-ollama.sh
+grep -q -- "-DAMDGPU_TARGETS=\"${ARCHS}\"" build-ollama.sh  # fail loudly if upstream changed the line
 # make the compiled tgz land in the mounted /build/output so it survives `--rm`
 sed -i 's#tar -czf /build/ollama-#tar -czf /build/output/ollama-#' build-ollama.sh
 sed -i 's#ls -lh /build/ollama-#ls -lh /build/output/ollama-#' build-ollama.sh

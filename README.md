@@ -60,6 +60,7 @@ The ROCm 7.1 runtime already ships `gfx1200` Tensile; you overlay the ROCm-6.3 `
 
 ```bash
 ./build_dual_arch.sh          # clones MTLoser base, applies multi-arch patches, builds image `ollama-dual`
+# other pairs: ARCHS="gfx906;gfx1100" ./build_dual_arch.sh   (untested beyond the default, see below)
 
 docker run -d --name ollama-dual \
     --device=/dev/kfd --device-cgroup-rule='c 226:* rmw' -v /dev/dri:/dev/dri \
